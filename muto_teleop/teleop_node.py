@@ -28,6 +28,7 @@ from geometry_msgs.msg import Twist, Vector3
 from rclpy.node import Node
 from std_msgs.msg import Bool
 
+from muto_teleop.joystick import Joystick
 from muto_teleop.muto_board import (
     AUTO_PORT, GIMBAL_HOLD, PAN_MAX, PAN_MIN, SPEED_MAX, SPEED_MIN, TILT_MAX,
     TILT_MIN,
@@ -57,6 +58,24 @@ class MutoTeleopNode(Node):
         self.declare_parameter('tilt_min', TILT_MIN)
         self.declare_parameter('tilt_max', TILT_MAX)
         self.declare_parameter('centre_gimbal_on_start', True)
+
+        # Joystick. Read from the device directly -- see joystick.py for why.
+        self.declare_parameter('joy_enabled', True)
+        self.declare_parameter('joy_device', '/dev/input/js0')
+        self.declare_parameter('axis_drive_y', 1)   # forward / back
+        self.declare_parameter('axis_turn', 0)      # left stick X
+        self.declare_parameter('axis_strafe', 6)    # 4-way pad X
+        self.declare_parameter('invert_turn', False)
+        self.declare_parameter('axis_cam_pan', 2)
+        self.declare_parameter('axis_cam_tilt', 3)
+        self.declare_parameter('invert_drive_y', True)
+        self.declare_parameter('invert_cam_pan', True)
+        self.declare_parameter('invert_cam_tilt', True)
+        self.declare_parameter('cam_pan_rate', 60.0)
+        self.declare_parameter('cam_tilt_rate', 40.0)
+        self.declare_parameter('deadman_button', -1)
+        self.declare_parameter('centre_camera_button', -1)
+        self.declare_parameter('joy_timeout', 1.0)
 
         port = self.get_parameter('port').value
         self.watchdog_timeout = float(self.get_parameter('watchdog_timeout').value)
@@ -102,6 +121,19 @@ class MutoTeleopNode(Node):
             self.board.gimbal(self._pan, self._tilt)
             self._sent_pan, self._sent_tilt = self._pan, self._tilt
             self.get_logger().info(f'gimbal homed to pan={self._pan} tilt={self._tilt}')
+
+        self.joy = None
+        self._centre_was_pressed = False
+        if self.get_parameter('joy_enabled').value:
+            device = self.get_parameter('joy_device').value
+            self.joy = Joystick(device)
+            self.joy.start()
+            self.get_logger().info(f'reading joystick from {device}')
+            if self.get_parameter('deadman_button').value < 0:
+                self.get_logger().warn(
+                    'no deadman button configured -- the left stick drives the '
+                    'robot with nothing held. Set deadman_button once the index '
+                    'is known.')
 
         self._running = True
         self._writer = threading.Thread(target=self._writer_loop, daemon=True)
@@ -161,6 +193,96 @@ class MutoTeleopNode(Node):
         return int(clamp(round(SPEED_MIN + magnitude * (SPEED_MAX - SPEED_MIN)),
                          SPEED_MIN, SPEED_MAX))
 
+    def _stick(self, axes, index, invert):
+        """Read one axis with the deadzone applied and the sign fixed up."""
+        if not 0 <= index < len(axes):
+            return 0.0
+        value = axes[index]
+        if abs(value) < self.deadzone:
+            return 0.0
+        return -value if invert else value
+
+    def _poll_joystick(self, dt):
+        """Fold the handle's current state into the desired state.
+
+        Called from the writer tick rather than from a callback, so the camera
+        integrates against the same clock that transmits it -- polling on one
+        timebase and integrating on another makes the aim rate depend on load.
+        """
+        axes, buttons, connected = self.joy.snapshot()
+
+        # A quiet handle is not the same as a centred one. A wireless pad that
+        # goes to sleep, or a dongle pulled out, leaves the last values in place
+        # unless something notices the silence.
+        quiet = time.monotonic() - self.joy.last_event > float(
+            self.get_parameter('joy_timeout').value)
+        if not connected or quiet:
+            self.set_gait(None)
+            return
+
+        # -- camera: rate control, integrated into an absolute target --------
+        pan_in = self._stick(axes, self.get_parameter('axis_cam_pan').value,
+                             self.get_parameter('invert_cam_pan').value)
+        tilt_in = self._stick(axes, self.get_parameter('axis_cam_tilt').value,
+                              self.get_parameter('invert_cam_tilt').value)
+
+        centre_button = self.get_parameter('centre_camera_button').value
+        centre_pressed = (0 <= centre_button < len(buttons)
+                          and buttons[centre_button])
+
+        with self._state_lock:
+            if centre_pressed and not self._centre_was_pressed:
+                self._pan = int(self.get_parameter('home_pan').value)
+                self._tilt = int(self.get_parameter('home_tilt').value)
+            elif pan_in or tilt_in:
+                self._pan = clamp(
+                    self._pan + pan_in * float(self.get_parameter('cam_pan_rate').value) * dt,
+                    self.get_parameter('pan_min').value,
+                    self.get_parameter('pan_max').value)
+                self._tilt = clamp(
+                    self._tilt + tilt_in * float(self.get_parameter('cam_tilt_rate').value) * dt,
+                    self.get_parameter('tilt_min').value,
+                    self.get_parameter('tilt_max').value)
+        self._centre_was_pressed = centre_pressed
+
+        # -- drive -----------------------------------------------------------
+        deadman = self.get_parameter('deadman_button').value
+        if 0 <= deadman < len(buttons) and not buttons[deadman]:
+            self.set_gait(None)
+            return
+
+        # Three ways to move, and the board can only do one at a time.
+        #   forward/back  left stick Y
+        #   turn          left stick X   -- the car convention, and the one a
+        #                                   hexapod actually needs
+        #   strafe        the 4-way pad  -- useful, but never at the cost of
+        #                                   being able to turn
+        forward = self._stick(axes, self.get_parameter('axis_drive_y').value,
+                              self.get_parameter('invert_drive_y').value)
+        turn = self._stick(axes, self.get_parameter('axis_turn').value,
+                           self.get_parameter('invert_turn').value)
+        strafe = self._stick(axes, self.get_parameter('axis_strafe').value, False)
+
+        if not forward and not turn and not strafe:
+            self.set_gait(None)
+            return
+
+        # Largest wins. A diagonal push has to resolve to something, and picking
+        # the dominant axis is more predictable than blending toward a gait the
+        # board does not have.
+        if abs(forward) >= max(abs(turn), abs(strafe)):
+            direction = 'forward' if forward > 0 else 'backward'
+            magnitude = abs(forward)
+        elif abs(turn) >= abs(strafe):
+            # Pan and yaw share a convention: positive is left.
+            direction = 'turn_left' if turn < 0 else 'turn_right'
+            magnitude = abs(turn)
+        else:
+            direction = 'right' if strafe > 0 else 'left'
+            magnitude = abs(strafe)
+
+        self.set_gait(direction, self._speed_from(magnitude))
+
     def set_gait(self, direction, speed=None):
         with self._state_lock:
             self._gait = direction
@@ -178,8 +300,16 @@ class MutoTeleopNode(Node):
         callback happened to fire first.
         """
         period = 1.0 / float(self.get_parameter('tick_hz').value)
+        previous = time.monotonic()
         while self._running:
+            now = time.monotonic()
+            # Integrate the camera against measured elapsed time, not the
+            # nominal period, so aim speed does not drift with scheduling.
+            dt = now - previous
+            previous = now
             try:
+                if self.joy is not None:
+                    self._poll_joystick(dt)
                 self._tick()
             except Exception as exc:  # a dead serial port must not kill the loop
                 self.get_logger().error(f'write failed: {exc}')
@@ -188,7 +318,10 @@ class MutoTeleopNode(Node):
     def _tick(self):
         with self._state_lock:
             gait, speed = self._gait, self._speed
-            pan, tilt = self._pan, self._tilt
+            # The target is carried as a float so rate integration accumulates
+            # smoothly, but the wire takes whole units -- round here so a
+            # fractional creep does not resend the same byte every tick.
+            pan, tilt = round(self._pan), round(self._tilt)
             stale = time.monotonic() - self._last_command > self.watchdog_timeout
 
         # A firmware gait runs until told otherwise. If commands stop arriving --
@@ -232,6 +365,8 @@ class MutoTeleopNode(Node):
         self._running = False
         if self._writer.is_alive():
             self._writer.join(timeout=1.0)
+        if self.joy is not None:
+            self.joy.stop()
         try:
             self.board.stay_put()
             self.board.close()

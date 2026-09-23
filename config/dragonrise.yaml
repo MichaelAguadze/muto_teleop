@@ -1,0 +1,61 @@
+# Mapping for the DragonRise 0079:181c receiver with a PS2-style wireless handle.
+#
+# Axis indices were read off this hardware, not assumed -- they vary between
+# pads, and this adapter reports eight axes of which only these four are the
+# sticks. Verified 2026-09-22:
+#
+#   axis 0, 1  left stick   X, Y    full +/-32767 span
+#   axis 2, 3  right stick  X, Y    full +/-32767 span
+#   axis 6, 7  4-way pad            three-state hat (-32767, 0, +32767)
+#   axis 4, 5  present, unidentified
+#
+# Sign convention on all four stick axes: positive X is right, positive Y is
+# DOWN. That is why both camera axes are inverted below.
+#
+# The handle must be in ANALOG mode or the sticks report nothing at all.
+
+/**:
+  ros__parameters:
+    joy_device: /dev/input/js0
+
+    # -- drive ---------------------------------------------------------------
+    axis_drive_y: 1          # left stick Y, + down  -> forward / back
+    axis_turn: 0             # left stick X, + right -> turn
+    axis_strafe: 6           # 4-way pad X           -> sidestep
+    # Push up to walk forward: up is negative on this pad.
+    invert_drive_y: true
+    invert_turn: false
+    # Turning is on the stick and strafing on the pad, not the other way round:
+    # a hexapod that cannot turn is far more limited than one that cannot
+    # sidestep, so turning gets the analogue control.
+
+    # -- camera, right stick ------------------------------------------------
+    axis_cam_pan: 2          # + right
+    axis_cam_tilt: 3         # + down
+    # Pan increases to the LEFT on this bracket, so a stick pushed right must
+    # decrease it. Tilt increases upward, and stick up is negative. Both invert.
+    invert_cam_pan: true
+    invert_cam_tilt: true
+
+    # Rate control, in board units per second. The right stick sets a speed of
+    # aim, not a position -- absolute mapping makes a low-resolution stick feel
+    # coarse, and these servos have no feedback to snap back to anyway.
+    cam_pan_rate: 60.0
+    cam_tilt_rate: 40.0
+
+    # -- buttons ------------------------------------------------------------
+    # NOT YET CONFIRMED on this handle. Buttons 0, 1, 3, 4, 6, 7, 8, 9, 11, 13
+    # and 14 have all been seen firing, but which physical button each one is
+    # has not been established. Set these once that is known.
+    #
+    # deadman_button gates DRIVING only. -1 disables the requirement, which is
+    # how it ships until a real index is confirmed -- a deadman wired to the
+    # wrong button is worse than none, because it looks like a safety feature
+    # while gating nothing.
+    deadman_button: -1
+    # Returns the camera to home (pan 90, tilt 4).
+    centre_camera_button: -1
+
+    # -- limits and feel ----------------------------------------------------
+    deadzone: 0.15           # these sticks do not return cleanly to zero
+    joy_timeout: 1.0         # stop if the handle goes quiet this long
