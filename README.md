@@ -15,9 +15,11 @@ nor `muto_hexapod_lib`, for reasons in [Why no vendor library](#why-no-vendor-li
 | Piece | State |
 |---|---|
 | Serial frame layer (`muto_board.py`) | Working — frames verified byte-for-byte against the vendor implementation |
-| Teleop node, gimbal control | **Working on hardware** — commanded through ROS, confirmed by camera |
-| Teleop node, `/cmd_vel` → gaits | Implemented, **not yet driven on hardware** |
-| Joystick input | Not yet built |
+| Teleop node, gimbal control | **Working on hardware** — via ROS topic and via the handle |
+| Joystick reader | **Working on hardware** — axes mapped from the device, not assumed |
+| Camera on the right stick | **Working on hardware** — directions confirmed correct |
+| Drive mapping | Implemented, **never yet walked** |
+| Deadman button | **Not configured** — see Safety |
 
 ## Interface
 
@@ -102,6 +104,29 @@ dominant axis and maps its magnitude to a speed level. It cannot translate and r
 For reference, the vendor `muto_driver` has a sharper edge: it forces any **nonzero** yaw to at
 least level 10, so through its `/cmd_vel` there is no gentle turn at all.
 
+## Gamepad
+
+DragonRise `0079:181c` receiver with a PS2-style wireless handle. **The handle must be in ANALOG
+mode** or the sticks report nothing at all — the buttons keep working, which makes it look like a
+half-broken pad rather than a mode problem.
+
+| Control | Axes | Does |
+|---|---|---|
+| Left stick Y | 1 | Forward / back |
+| Left stick X | 0 | Turn |
+| Right stick | 2, 3 | Camera pan / tilt, as a rate |
+| 4-way pad X | 6 | Strafe |
+
+Turning is on the analogue stick and strafing on the pad, not the reverse: a hexapod that cannot
+turn is far more limited than one that cannot sidestep.
+
+The camera is **rate** controlled — stick deflection is a speed of aim, not a position. With no
+position feedback on these servos there is nothing to snap back to, and absolute mapping on a
+low-resolution stick feels coarse.
+
+Axis indices were read off this hardware with `js_probe.py`. They are not portable: this adapter
+reports eight axes of which four are sticks, and the other four include a three-state hat.
+
 ## Safety
 
 - A firmware gait **runs until stopped**. There is no board-side timeout.
@@ -109,6 +134,11 @@ least level 10, so through its `/cmd_vel` there is no gentle turn at all.
   shutdown. Camera commands deliberately do **not** feed the watchdog — panning should not keep a
   walking robot walking after its driver has gone silent.
 - Torque off leaves nothing holding the robot up. Support the body first.
+- **`deadman_button` is currently `-1`, meaning drive is not gated.** The left stick walks the
+  robot with nothing held. The node warns about this on startup. Set a button index in
+  `config/dragonrise.yaml` to close it. A deadman pointed at the wrong index is worse than none —
+  it looks like a safety feature while gating nothing — which is why it ships disabled rather than
+  guessed.
 
 ## Development
 
